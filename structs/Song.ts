@@ -4,6 +4,7 @@ import youtube from "youtube-sr";
 import { i18n } from "../utils/i18n";
 import { videoPattern, isURL } from "../utils/patterns";
 import { spawn, ChildProcess } from "node:child_process";
+import { join } from "node:path";
 
 export interface SongData {
   url: string;
@@ -18,6 +19,12 @@ export class Song {
 
   // hold spawned processes so we can kill them on stop/skip
   private procs?: { ytdlp: ChildProcess; ffmpeg: ChildProcess };
+
+  // resolve binary paths
+  private static readonly YTDLP_PATH =
+    process.env.YTDLP_PATH || join(process.cwd(), "bin", "yt-dlp");
+  private static readonly FFMPEG_PATH =
+    process.env.FFMPEG_PATH || "ffmpeg"; // provided by apt.txt
 
   public constructor({ url, title, duration }: SongData) {
     this.url = url;
@@ -36,9 +43,9 @@ export class Song {
       // Use youtube-sr for lightweight metadata (no play-dl)
       const info = await youtube.getVideo(url);
 
-      finalUrl = info?.url ?? url;                            // fallback to original url
+      finalUrl = info?.url ?? url; // fallback to original url
       title = info?.title ?? "Unknown title";
-      // youtube-sr gives duration in ms (number) or may be undefined
+      // youtube-sr duration is number (ms) or undefined
       const durMs = typeof info?.duration === "number" ? info.duration : 0;
       durationSec = Math.round(durMs / 1000);
     } else {
@@ -68,13 +75,12 @@ export class Song {
    */
   public async makeResource(): Promise<AudioResource<Song>> {
     // 1) yt-dlp: fetch best audio to stdout
-    // stdio: ['ignore','pipe','inherit'] means stdin=null for yt-dlp; that's fine.
-    const ytdlp = spawn("yt-dlp", ["-f", "bestaudio", "-o", "-", this.url], {
+    const ytdlp = spawn(Song.YTDLP_PATH, ["-f", "bestaudio", "-o", "-", this.url], {
       stdio: ["ignore", "pipe", "inherit"]
     });
 
     // 2) ffmpeg: transcode to 48kHz stereo PCM from stdin, write raw PCM to stdout
-    const ffmpeg = spawn("ffmpeg", [
+    const ffmpeg = spawn(Song.FFMPEG_PATH, [
       "-loglevel", "error",
       "-i", "pipe:0",
       "-f", "s16le",
@@ -84,7 +90,6 @@ export class Song {
     ], { stdio: ["pipe", "pipe", "inherit"] });
 
     // Pipe yt-dlp output -> ffmpeg input
-    // ytdlp.stdout is a Readable stream when stdio[1] = 'pipe'
     if (ytdlp.stdout && ffmpeg.stdin) {
       ytdlp.stdout.pipe(ffmpeg.stdin);
     } else {
@@ -94,7 +99,6 @@ export class Song {
     // Save processes to clean up later
     this.procs = { ytdlp, ffmpeg };
 
-    // 3) Create Discord resource from ffmpeg stdout
     if (!ffmpeg.stdout) {
       throw new Error("ffmpeg did not expose stdout");
     }
