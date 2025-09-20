@@ -1,8 +1,9 @@
+// structs/Song.ts
 import { AudioResource, createAudioResource, StreamType } from "@discordjs/voice";
 import youtube from "youtube-sr";
 import { i18n } from "../utils/i18n";
 import { videoPattern, isURL } from "../utils/patterns";
-import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, ChildProcess } from "node:child_process";
 
 export interface SongData {
   url: string;
@@ -15,8 +16,8 @@ export class Song {
   public readonly title: string;
   public readonly duration: number;
 
-  // we’ll hold the spawned processes so we can kill them on stop/skip
-  private procs?: { ytdlp: ChildProcessWithoutNullStreams; ffmpeg: ChildProcessWithoutNullStreams };
+  // hold spawned processes so we can kill them on stop/skip
+  private procs?: { ytdlp: ChildProcess; ffmpeg: ChildProcess };
 
   public constructor({ url, title, duration }: SongData) {
     this.url = url;
@@ -26,32 +27,39 @@ export class Song {
 
   public static async from(url: string = "", search: string = "") {
     const isYoutubeUrl = videoPattern.test(url);
-    let finalUrl = url;
+
+    let finalUrl = "";
     let title = "";
-    let duration = 0;
+    let durationSec = 0;
 
     if (isYoutubeUrl) {
-      // Use youtube-sr just for quick metadata so we don’t hit play-dl
+      // Use youtube-sr for lightweight metadata (no play-dl)
       const info = await youtube.getVideo(url);
-      finalUrl = info.url;
-      title = info.title;
-      duration = info.duration / 1000; // youtube-sr gives ms
+
+      finalUrl = info?.url ?? url;                            // fallback to original url
+      title = info?.title ?? "Unknown title";
+      // youtube-sr gives duration in ms (number) or may be undefined
+      const durMs = typeof info?.duration === "number" ? info.duration : 0;
+      durationSec = Math.round(durMs / 1000);
     } else {
       const result = await youtube.searchOne(search);
+
       if (!result) {
         const err = new Error(`No search results found for ${search}`);
         err.name = isURL.test(url) ? "InvalidURL" : "NoResults";
         throw err;
       }
+
       finalUrl = `https://youtube.com/watch?v=${result.id}`;
-      title = result.title;
-      duration = result.duration / 1000;
+      title = result.title ?? "Unknown title";
+      const durMs = typeof result.duration === "number" ? result.duration : 0;
+      durationSec = Math.round(durMs / 1000);
     }
 
     return new this({
       url: finalUrl,
       title,
-      duration: Math.round(duration)
+      duration: durationSec
     });
   }
 
@@ -59,12 +67,13 @@ export class Song {
    * Spawn yt-dlp -> ffmpeg and return a Discord AudioResource
    */
   public async makeResource(): Promise<AudioResource<Song>> {
-    // 1) spawn yt-dlp to fetch best audio
+    // 1) yt-dlp: fetch best audio to stdout
+    // stdio: ['ignore','pipe','inherit'] means stdin=null for yt-dlp; that's fine.
     const ytdlp = spawn("yt-dlp", ["-f", "bestaudio", "-o", "-", this.url], {
       stdio: ["ignore", "pipe", "inherit"]
     });
 
-    // 2) spawn ffmpeg to convert to 48kHz stereo PCM
+    // 2) ffmpeg: transcode to 48kHz stereo PCM from stdin, write raw PCM to stdout
     const ffmpeg = spawn("ffmpeg", [
       "-loglevel", "error",
       "-i", "pipe:0",
@@ -74,13 +83,22 @@ export class Song {
       "pipe:1"
     ], { stdio: ["pipe", "pipe", "inherit"] });
 
-    // Pipe yt-dlp output into ffmpeg input
-    ytdlp.stdout.pipe(ffmpeg.stdin);
+    // Pipe yt-dlp output -> ffmpeg input
+    // ytdlp.stdout is a Readable stream when stdio[1] = 'pipe'
+    if (ytdlp.stdout && ffmpeg.stdin) {
+      ytdlp.stdout.pipe(ffmpeg.stdin);
+    } else {
+      throw new Error("Failed to connect yt-dlp to ffmpeg (no stdout/stdin).");
+    }
 
-    // Save processes so we can clean up later
+    // Save processes to clean up later
     this.procs = { ytdlp, ffmpeg };
 
-    // 3) create Discord resource from ffmpeg stdout
+    // 3) Create Discord resource from ffmpeg stdout
+    if (!ffmpeg.stdout) {
+      throw new Error("ffmpeg did not expose stdout");
+    }
+
     return createAudioResource(ffmpeg.stdout, {
       metadata: this,
       inputType: StreamType.Raw,
