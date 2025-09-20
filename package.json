@@ -14,6 +14,7 @@
   "scripts": {
     "dev": "nodemon index.ts",
     "start": "ts-node index.ts",
+    "postinstall": "mkdir -p bin && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o bin/yt-dlp && chmod +x bin/yt-dlp",
     "build": "tsc --build",
     "prod": "npm run build && node ./dist/index.js",
     "commit": "cz",
